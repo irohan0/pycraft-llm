@@ -1,15 +1,37 @@
+# Python
 __pycache__/
 *.py[cod]
-*.pth
+*.pyo
+
+# Model checkpoints and weights
+checkpoints/
 *.safetensors
 *.bin
-checkpoints/
-data/cache/
+*.pt
+*.pth
+
+# Training data (large files - do not push)
+data/pretrain_python/
+data/pretrain_curriculum/
+data/pretrain_parts/
+data/pretrain_temp/
 data/sft/
-tokenizer/vocab/
+data/cache/
+
+# Upload package (HF handles this)
+upload_package/
+
+# Logs
 logs/
+
+# Tokenizer vocab (generated, not source)
+tokenizer/vocab/
+
+# Environment
 .env
 wandb/
 *.egg-info/
-dist/
-build/
+
+# OS
+.DS_Store
+Thumbs.db
