@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pth
+*.safetensors
+*.bin
+checkpoints/
+data/cache/
+data/sft/
+tokenizer/vocab/
+logs/
+.env
+wandb/
+*.egg-info/
+dist/
+build/
