@@ -39,7 +39,7 @@ pycraft serve                  # http://127.0.0.1:8000/docs
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/completions` | Continue a prompt. Set `"stream": true` for SSE. |
+| `POST /v1/completions` | Continue a prompt, or a list of prompts as one batch. Set `"stream": true` for SSE (single prompt only). |
 | `POST /v1/fim` | Fill the gap between `prefix` and `suffix`. |
 | `GET /health` | Liveness plus the loaded configuration. |
 | `GET /v1/models` | Model metadata. |
@@ -93,6 +93,27 @@ context:
 
 On a realistic workload (200-token prompt, 400 generated) this is **8.8x**:
 48.5s becomes 5.5s. `--quantize` adds roughly 1.4x on top (68 -> 94 tok/s).
+
+Batching several prompts multiplies throughput again, because per-token cost
+is dominated by weight loading that every sequence in the batch shares:
+
+| Batch size | Aggregate |
+|---|---|
+| 1 | 65.7 tok/s |
+| 2 | 129.9 tok/s |
+| 4 | 186.7 tok/s |
+| 8 | 267.7 tok/s |
+
+Pass a list to `/v1/completions` (or `PyCraft.generate_batch`) to use it.
+Prompts are left-padded internally and each result is cut at its own EOS, so
+mixed lengths are fine:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":["def add(a, b):\n","def rev(s):\n"],"max_tokens":40}'
+# -> {"choices":[{"index":0,...},{"index":1,...}], ...}
+```
 
 ## Limitations
 

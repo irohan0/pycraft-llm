@@ -69,7 +69,11 @@ app = FastAPI(
 # Schemas
 # ------------------------------------------------------------------ #
 class CompletionRequest(BaseModel):
-    prompt: str = Field(..., description="Prompt to continue")
+    prompt: str | list[str] = Field(
+        ...,
+        description="Prompt to continue. A list is completed as one batch, "
+                    "which is substantially faster than separate requests.",
+    )
     max_tokens: int = Field(200, ge=1, le=1024)
     temperature: float = Field(0.2, ge=0.0, le=2.0,
                                description="0.0 selects greedy decoding")
@@ -128,6 +132,39 @@ def completions(req: CompletionRequest):
         stop=req.stop,
         seed=req.seed,
     )
+
+    # ---- batch: several prompts in one set of forward passes ----
+    if isinstance(req.prompt, list):
+        if req.stream:
+            raise HTTPException(
+                status_code=422,
+                detail="stream=true is not supported with a list of prompts; "
+                       "send them as separate streaming requests",
+            )
+        if not req.prompt:
+            raise HTTPException(status_code=422, detail="prompt list is empty")
+
+        started = time.time()
+        with _slots:
+            try:
+                texts = engine.generate_batch(req.prompt, **kwargs)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if req.strip_markdown:
+            texts = [strip_fences(t) for t in texts]
+
+        return {
+            "object": "text_completion",
+            "model": "pycraft-1",
+            "choices": [{"index": i, "text": t} for i, t in enumerate(texts)],
+            "usage": {
+                "prompt_tokens": sum(len(engine.tokenizer.encode(p))
+                                     for p in req.prompt),
+                "completion_tokens": sum(len(engine.tokenizer.encode(t))
+                                         for t in texts),
+            },
+            "elapsed_s": round(time.time() - started, 3),
+        }
 
     if req.stream:
         def sse():

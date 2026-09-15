@@ -352,7 +352,104 @@ def test_context_limit():
 
 
 # ------------------------------------------------------------------ #
-# 10. Timing (informational only — never assert on wall clock)
+# 10. Batched generation
+# ------------------------------------------------------------------ #
+def test_batched_equivalence():
+    """
+    The load-bearing test for left padding. If the key-padding mask leaked, or
+    the RoPE offset shift mattered, shorter (more heavily padded) rows would
+    diverge from their single-sequence result while longer ones stayed fine.
+    """
+    model, cfg = build_model()
+    torch.manual_seed(7)
+    prompts = [
+        torch.randint(0, cfg.vocab_size, (11,)).tolist(),
+        torch.randint(0, cfg.vocab_size, (5,)).tolist(),   # most padding
+        torch.randint(0, cfg.vocab_size, (18,)).tolist(),  # none
+    ]
+    kw = dict(temperature=0.0, eos_token_id=None)
+
+    single = [
+        model.generate(torch.tensor([p]), max_new_tokens=24, **kw)[0, len(p):].tolist()
+        for p in prompts
+    ]
+    batched = model.generate_batch(prompts, max_new_tokens=24, **kw)
+
+    for i, (s, b) in enumerate(zip(single, batched)):
+        if s != b:
+            d = next(j for j, (x, y) in enumerate(zip(s, b)) if x != y)
+            raise AssertionError(
+                f"row {i} (prompt len {len(prompts[i])}) diverged at token {d}: "
+                f"single={s[d]} batched={b[d]}"
+            )
+    ok("batched generation matches single-sequence, row for row")
+
+
+def test_batched_per_row_eos():
+    model, cfg = build_model()
+    torch.manual_seed(7)
+    prompts = [torch.randint(0, cfg.vocab_size, (n,)).tolist() for n in (6, 9)]
+
+    # Force EOS on every token: each row must stop immediately with 0 output
+    out = model.generate_batch(prompts, max_new_tokens=20, temperature=0.0,
+                               eos_token_id=list(range(cfg.vocab_size)))
+    assert all(len(o) == 0 for o in out), f"EOS not honoured per row: {[len(o) for o in out]}"
+
+    # eos_token_id=None runs the full budget for every row
+    out = model.generate_batch(prompts, max_new_tokens=12, temperature=0.0,
+                               eos_token_id=None)
+    assert all(len(o) == 12 for o in out), f"budget not honoured: {[len(o) for o in out]}"
+
+    assert model.generate_batch([], max_new_tokens=8) == [], "empty batch"
+    ok("batched EOS truncates per row; empty batch handled")
+
+
+def test_padding_mask():
+    """Padded keys must be excluded, and no query row may be fully masked."""
+    pad = torch.tensor([[False, False, True, True]])      # 2 pads, then 2 real
+    mask = build_attn_mask(q_len=4, offset=0, device="cpu", padding_mask=pad)
+    assert mask is not None, "padding must force an explicit mask"
+    assert mask.shape == (1, 1, 4, 4), mask.shape
+
+    # Real query rows must not attend to padded columns
+    for i in (2, 3):
+        for j in (0, 1):
+            assert not bool(mask[0, 0, i, j]), f"row {i} attends to pad col {j}"
+    # Causality still holds
+    assert not bool(mask[0, 0, 2, 3]), "row 2 must not see the future"
+    # No fully-masked row (otherwise softmax -> NaN)
+    assert bool(mask.any(dim=-1).all()), "a query row is fully masked"
+
+    # Decode step with padding must also produce a mask, not None
+    pad2 = torch.tensor([[False, True, True]])
+    m2 = build_attn_mask(q_len=1, offset=2, device="cpu", padding_mask=pad2)
+    assert m2 is not None and m2.shape == (1, 1, 1, 3)
+    assert not bool(m2[0, 0, 0, 0]) and bool(m2[0, 0, 0, 2])
+
+    try:
+        build_attn_mask(q_len=4, offset=0, device="cpu",
+                        padding_mask=torch.ones(1, 9, dtype=torch.bool))
+        raise AssertionError("mismatched padding_mask length should raise")
+    except ValueError:
+        pass
+    ok("padding mask excludes pads, preserves causality, avoids NaN rows")
+
+
+def test_batched_no_nan():
+    """Heavy left padding is where NaN would surface if it were going to."""
+    model, cfg = build_model()
+    torch.manual_seed(7)
+    prompts = [torch.randint(0, cfg.vocab_size, (n,)).tolist() for n in (1, 40)]
+    out = model.generate_batch(prompts, max_new_tokens=8, temperature=0.0,
+                               eos_token_id=None)
+    for row in out:
+        assert len(row) == 8
+        assert all(0 <= t < cfg.vocab_size for t in row), "invalid token id (NaN logits?)"
+    ok("no NaN under extreme padding imbalance (1 vs 40 tokens)")
+
+
+# ------------------------------------------------------------------ #
+# 11. Timing (informational only — never assert on wall clock)
 # ------------------------------------------------------------------ #
 def report_timing():
     model, cfg = build_model()
@@ -392,6 +489,10 @@ if __name__ == "__main__":
         test_cache_reuse,
         test_eos_stops,
         test_context_limit,
+        test_padding_mask,
+        test_batched_equivalence,
+        test_batched_per_row_eos,
+        test_batched_no_nan,
     ):
         fn()
 

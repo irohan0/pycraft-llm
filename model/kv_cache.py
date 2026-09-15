@@ -172,20 +172,28 @@ def build_attn_mask(
     q_len: int,
     offset: int,
     device,
+    padding_mask: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """
     Build a bottom-right-aligned causal mask for cached attention.
 
-    Returns None for the two cases SDPA handles without an explicit mask:
+    Args:
+        padding_mask: optional (batch, offset + q_len) bool marking real
+            tokens True and padding False. Required for batched generation,
+            where shorter prompts are left-padded to a common length.
+
+    With no padding mask, returns None for the two cases SDPA handles on its
+    own:
 
         offset == 0   caller passes is_causal=True (square, so PyTorch's
                       upper-left alignment is already correct)
         q_len  == 1   the single newest query may attend to every cached
                       key, so causality holds structurally — no mask needed
 
-    Otherwise returns (1, 1, q_len, offset + q_len) bool, True = "may attend":
+    Otherwise returns bool "may attend", (1, 1, q_len, offset + q_len) or
+    (batch, 1, q_len, offset + q_len) when padding is involved:
 
-        mask[i, j] = (j <= offset + i)
+        mask[i, j] = (j <= offset + i) and not padding[j]
 
     WHY THIS EXISTS: PyTorch builds is_causal as torch.ones(L, S).tril() —
     UPPER-LEFT aligned. With L=1, S=N that mask contains exactly one True
@@ -194,13 +202,33 @@ def build_attn_mask(
     that ignores the prompt and collapses into repetition. Hence the explicit
     dispatch rather than a blanket is_causal=True.
     """
-    if offset == 0 or q_len == 1:
+    if padding_mask is None and (offset == 0 or q_len == 1):
         return None
 
     kv_len = offset + q_len
     q_pos = torch.arange(offset, kv_len, device=device).unsqueeze(1)  # (T, 1)
     k_pos = torch.arange(0, kv_len, device=device).unsqueeze(0)       # (1, S)
-    return (k_pos <= q_pos)[None, None, :, :]                        # (1,1,T,S)
+    mask = (k_pos <= q_pos)[None, None, :, :]                        # (1,1,T,S)
+
+    if padding_mask is not None:
+        if padding_mask.shape[-1] != kv_len:
+            raise ValueError(
+                f"padding_mask covers {padding_mask.shape[-1]} positions but "
+                f"the key length is {kv_len} (offset {offset} + q_len {q_len})"
+            )
+        # (B,1,1,S) broadcast against the causal (1,1,T,S) -> (B,1,T,S)
+        mask = mask & padding_mask[:, None, None, :].to(torch.bool)
+
+        # A fully-masked query row makes softmax(all -inf) = NaN, which then
+        # spreads through the residual stream. Left-padded rows hit this: a
+        # pad token's own row can have every key masked. Letting each query
+        # attend to at least its own position costs nothing (those outputs are
+        # discarded) and keeps the tensor finite.
+        qi = torch.arange(q_len, device=device)
+        mask = mask.clone()
+        mask[:, :, qi, offset + qi] = True
+
+    return mask
 
 
 # ------------------------------------------------------------------ #

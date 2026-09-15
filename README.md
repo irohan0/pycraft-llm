@@ -524,7 +524,7 @@ pycraft serve            # http://127.0.0.1:8000/docs
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/completions` | Continue a prompt. Set `"stream": true` for SSE. |
+| `POST /v1/completions` | Continue a prompt, or a list of prompts as one batch. Set `"stream": true` for SSE (single prompt only). |
 | `POST /v1/fim` | Fill the gap between `prefix` and `suffix`. |
 | `GET /health` | Liveness plus the loaded configuration. |
 | `GET /v1/models` | Model metadata. |
@@ -565,6 +565,8 @@ Generation uses a KV cache, so per-token cost is flat rather than growing with c
 | 512 | 6.6 tok/s | 48.6 tok/s |
 
 On a realistic workload (200-token prompt, 400 generated) this is **8.8×**: 48.5s becomes 5.5s. `--quantize` adds roughly 1.4× on top (68 → 94 tok/s).
+
+Batching multiplies throughput again, since per-token cost is dominated by weight loading that every sequence in the batch shares (1 / 2 / 4 / 8 prompts = 65.7 / 129.9 / 186.7 / **267.7** tok/s aggregate). Pass a list to `/v1/completions` or `PyCraft.generate_batch`; prompts are left-padded internally and each result is cut at its own EOS, so mixed lengths are fine.
 
 The 1024-token context is a **hard stop**, not a sliding window: the KV cache stores post-RoPE keys, which cannot be re-based without re-rotating every cached key.
 

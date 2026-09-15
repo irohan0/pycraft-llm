@@ -84,6 +84,7 @@ class PyCraftModel(nn.Module):
         use_cache: bool | None = None,            # None = auto (on iff a cache given)
         num_logits_to_keep: int = 0,              # 0 = all positions
         ignore_index: int = -100,                 # label value excluded from loss
+        attention_mask: torch.Tensor | None = None,   # (batch, offset + seq_len)
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
@@ -118,8 +119,10 @@ class PyCraftModel(nn.Module):
 
         # 2. Build the causal mask ONCE and share it across all blocks.
         #    Returns None on the two fast paths (offset 0, or single-token
-        #    decode) where SDPA needs no explicit mask.
-        attn_mask = build_attn_mask(seq_len, offset, x.device)
+        #    decode) where SDPA needs no explicit mask — but never when
+        #    padding is present, since padded keys must be excluded.
+        attn_mask = build_attn_mask(seq_len, offset, x.device,
+                                    padding_mask=attention_mask)
 
         # 3. Pass through transformer blocks
         for block in self.blocks:
@@ -303,6 +306,125 @@ class PyCraftModel(nn.Module):
         tail = torch.tensor([new_ids], dtype=prepared.dtype,
                             device=prepared.device)
         return torch.cat([prepared, tail], dim=1)
+
+    @torch.no_grad()
+    def generate_batch(
+        self,
+        prompts: list[list[int]],   # one token-id list per sequence
+        max_new_tokens: int = 128,
+        temperature: float = 0.8,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        eos_token_id: int | list[int] | None = 0,
+        pad_token_id: int = 4,
+        seed: int | None = None,
+        device=None,
+    ) -> list[list[int]]:
+        """
+        Generate for several prompts in one set of forward passes.
+
+        Returns the NEW tokens per prompt (the prompt is not echoed back),
+        each already truncated at its own EOS.
+
+        Prompts are LEFT-padded so every sequence ends at the same column,
+        which keeps logits[:, -1] valid for every row. Right padding would
+        put junk at that position and silently sample from it.
+
+        Left padding is safe for RoPE specifically because RoPE is relative:
+        shifting a whole sequence forward by k positions leaves every pairwise
+        distance within it unchanged, so a uniform offset costs nothing as
+        long as the pad columns are masked out. The key-padding mask handles
+        that, and also guarantees no query row is fully masked (which would
+        make softmax produce NaN).
+        """
+        was_training = self.training
+        self.eval()
+        try:
+            if not prompts:
+                return []
+            device = device or self.token_embedding.weight.device
+            max_len = self.config.max_seq_len
+
+            # Truncate over-long prompts, then left-pad to a common width
+            prompts = [p[-(max_len - 1):] if len(p) >= max_len else list(p)
+                       for p in prompts]
+            batch = len(prompts)
+            width = max(len(p) for p in prompts)
+            budget = min(max_new_tokens, max_len - width)
+            if budget <= 0:
+                return [[] for _ in prompts]
+
+            padded, pad_mask = [], []
+            for p in prompts:
+                gap = width - len(p)
+                padded.append([pad_token_id] * gap + p)
+                pad_mask.append([False] * gap + [True] * len(p))
+
+            input_ids = torch.tensor(padded, dtype=torch.long, device=device)
+            mask = torch.tensor(pad_mask, dtype=torch.bool, device=device)
+
+            eos_ids = ([] if eos_token_id is None
+                       else [eos_token_id] if isinstance(eos_token_id, int)
+                       else list(eos_token_id))
+            eos_set = set(eos_ids)
+
+            generator = None
+            if seed is not None:
+                generator = torch.Generator(device=device)
+                generator.manual_seed(seed)
+
+            cache = KVCache.from_model(
+                self, batch_size=batch, max_len=width + budget,
+                device=device, dtype=self.token_embedding.weight.dtype,
+            )
+
+            logits, _ = self(input_ids, past_key_values=cache, use_cache=True,
+                             num_logits_to_keep=1, attention_mask=mask)
+            next_logits = logits[:, -1, :]
+
+            out = input_ids
+            results: list[list[int]] = [[] for _ in range(batch)]
+            finished = [False] * batch
+
+            for _ in range(budget):
+                next_token = sample_next_token(
+                    next_logits, out, temperature, top_k, top_p,
+                    repetition_penalty, generator=generator,
+                )                                        # (batch, 1)
+
+                for row in range(batch):
+                    if finished[row]:
+                        # Keep the row in the batch but stop recording it;
+                        # feeding pad keeps shapes rectangular.
+                        next_token[row, 0] = pad_token_id
+                        continue
+                    token = int(next_token[row, 0])
+                    if token in eos_set:
+                        finished[row] = True
+                        next_token[row, 0] = pad_token_id
+                    else:
+                        results[row].append(token)
+
+                if all(finished):
+                    break
+
+                out = torch.cat([out, next_token], dim=1)
+                # Newly written cache positions are real columns for every
+                # row; a finished row only ever attends to itself, so its
+                # filler cannot affect any other sequence.
+                mask = torch.cat(
+                    [mask, torch.ones(batch, 1, dtype=torch.bool, device=device)],
+                    dim=1,
+                )
+                logits, _ = self(next_token, past_key_values=cache,
+                                 use_cache=True, num_logits_to_keep=1,
+                                 attention_mask=mask)
+                next_logits = logits[:, -1, :]
+
+            return results
+        finally:
+            self.train(was_training)
 
     def param_count(self) -> dict:
         total = sum(p.numel() for p in self.parameters())
