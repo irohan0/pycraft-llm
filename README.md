@@ -23,6 +23,7 @@ PyCraft-1 demonstrates that a domain-specific code language model can be **train
 - [Model Capabilities](#model-capabilities)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Running Locally](#running-locally)
 - [Repository Structure](#repository-structure)
 - [Reproducing Results](#reproducing-results)
 - [Novel Contributions](#novel-contributions)
@@ -487,6 +488,84 @@ python -m eval.evaluate
 
 ---
 
+## Running Locally
+
+PyCraft-1 runs on CPU. There is no hosted service and nothing here costs money to run.
+
+```bash
+pip install -e ".[serve]"
+```
+
+Weights resolve from `checkpoints/sft_stage1` when running from a clone, and fall back to downloading from HuggingFace otherwise (`pip install -e ".[hub]"`).
+
+### Command line
+
+```bash
+pycraft info
+pycraft generate "# Task: reverse a list\n\ndef reverse_list(xs):\n"
+pycraft fim --prefix 'def square(n):\n    ' --suffix '\n\nprint(square(4))' --full
+pycraft chat
+pycraft serve --port 8000
+```
+
+Useful flags: `--quantize` (int8, ~1.4× faster on CPU), `--threads N`, `-t/--temperature` (0.0 is greedy), `-n/--max-tokens`, `--stop` (repeatable).
+
+### REST API
+
+```bash
+pycraft serve            # http://127.0.0.1:8000/docs
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/completions` | Continue a prompt. Set `"stream": true` for SSE. |
+| `POST /v1/fim` | Fill the gap between `prefix` and `suffix`. |
+| `GET /health` | Liveness plus the loaded configuration. |
+| `GET /v1/models` | Model metadata. |
+
+**Fill-in-the-Middle** is the endpoint worth knowing about. Half of pretraining used the FIM objective, so infilling is trained behaviour rather than a prompting trick:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/fim \
+  -H 'Content-Type: application/json' \
+  -d '{"prefix":"def factorial(n):\n    if n <= 1:\n        return 1\n    ",
+       "suffix":"\n\nprint(factorial(5))\n"}'
+# -> {"middle": "return n * factorial(n-1)\n\n", ...}
+```
+
+The server binds to `127.0.0.1` and has **no authentication**. To share it temporarily, put a free tunnel in front of it rather than binding wider:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8000
+```
+
+### Docker
+
+```bash
+docker build -t pycraft .
+docker run --rm -p 127.0.0.1:8000:8000 pycraft
+```
+
+CPU-only image. Weights are baked in; mount `checkpoints/` instead to keep the image small.
+
+### Inference performance
+
+Generation uses a KV cache, so per-token cost is flat rather than growing with context. Measured on the same laptop running **CPU-only**, 8 threads:
+
+| Context | Without cache | With cache |
+|---|---|---|
+| 32 | 31.0 tok/s | 61.9 tok/s |
+| 256 | 12.3 tok/s | 53.7 tok/s |
+| 512 | 6.6 tok/s | 48.6 tok/s |
+
+On a realistic workload (200-token prompt, 400 generated) this is **8.8×**: 48.5s becomes 5.5s. `--quantize` adds roughly 1.4× on top (68 → 94 tok/s).
+
+The 1024-token context is a **hard stop**, not a sliding window: the KV cache stores post-RoPE keys, which cannot be re-based without re-rotating every cached key.
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full reference.
+
+---
+
 ## Repository Structure
 
 ```
@@ -497,7 +576,9 @@ pycraft-llm/
 │   ├── attention.py            # GQA + QK-Norm + RoPE
 │   ├── feedforward.py          # SwiGLU FFN
 │   ├── transformer.py          # Single transformer block
-│   └── pycraft_model.py        # Full model + generation
+│   ├── kv_cache.py             # KV cache + causal mask construction
+│   ├── sampling.py             # top-k / top-p / repetition penalty
+│   └── pycraft_model.py        # Full model + cached generation
 │
 ├── tokenizer/                  # Tokenizer
 │   ├── train_tokenizer.py      # BPE training on Python code
@@ -520,10 +601,22 @@ pycraft-llm/
 │   ├── evaluate.py             # Generation quality test
 │   └── humaneval_runner.py     # HumanEval benchmark
 │
+├── pycraft/                    # Inference package (CLI + REST API)
+│   ├── engine.py               # Loading, generation, FIM, quantization
+│   ├── server.py               # FastAPI app
+│   └── cli.py                  # pycraft generate/fim/serve/chat
+│
+├── tests/                      # Correctness tests
+│   └── test_kv_cache.py        # Cached vs uncached equivalence
+│
 ├── scripts/                    # Utility scripts
 │   └── download_pretrain_data.py  # Dataset download
 │
-├── config.yaml                 # Single source of truth for all hyperparams
+├── docs/
+│   └── DEPLOYMENT.md           # Running PyCraft-1 locally
+│
+├── pyproject.toml              # Installable package + CLI entry point
+├── Dockerfile                  # CPU-only inference image
 ├── environment.yml             # Conda environment spec
 └── README.md                   # This file
 ```
