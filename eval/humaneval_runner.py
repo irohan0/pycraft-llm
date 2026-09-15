@@ -1,5 +1,6 @@
 # eval/humaneval_runner.py — final clean version
 
+import ast
 import json
 import os
 import re
@@ -110,6 +111,57 @@ def extract_body_lines(raw: str) -> list:
     return body if body else ['    pass']
 
 
+def extract_body_candidates(raw: str) -> list:
+    """
+    The model often emits several attempts in one generation — a truncated
+    first draft, then a complete rewrite, each in its own markdown fence.
+    Taking the first blindly (and discarding it as truncated) scores the
+    harness rather than the model, so collect every attempt and let the
+    caller pick the first that actually parses.
+
+    Returned in generation order, best-effort first.
+    """
+    candidates = []
+    seen = set()
+
+    def add(body):
+        if not body:
+            return
+        key = "\n".join(body)
+        # Skip placeholder-only bodies; they carry no information
+        if key in seen or body[0].strip().startswith("pass"):
+            return
+        seen.add(key)
+        candidates.append(body)
+
+    # Each fenced block is one attempt
+    for chunk in re.split(r"```[\w]*", raw):
+        if chunk.strip():
+            add(extract_body_lines(chunk))
+
+    # Fall back to treating the whole generation as one block
+    add(extract_body_lines(raw))
+    return candidates
+
+
+def best_solution(he_prompt: str, raw: str) -> str:
+    """
+    Assemble the first candidate body that yields syntactically valid Python.
+
+    Syntax validity only — correctness is decided by the unit tests, exactly
+    as before. This just avoids scoring a parse failure that the model did
+    not actually make.
+    """
+    for body in extract_body_candidates(raw):
+        solution = build_solution(he_prompt, body)
+        try:
+            ast.parse(solution)
+            return solution
+        except SyntaxError:
+            continue
+    return build_solution(he_prompt, ['    pass'])
+
+
 def get_clean_prompt_header(he_prompt: str) -> str:
     """
     Extract ONLY the function signature line from he_prompt.
@@ -205,8 +257,22 @@ def make_model_prompt(he_prompt: str) -> str:
     return f"# Task: {desc}\n\n{sig}\n"
 
 
-def execute_solution(solution: str, test_code: str, timeout: int = 5) -> bool:
-    full = solution + "\n\n" + test_code + "\n\ncheck(candidate)"
+def execute_solution(
+    solution: str,
+    test_code: str,
+    entry_point: str,
+    timeout: int = 5,
+) -> bool:
+    """
+    Run the problem's own `check()` against the generated function.
+
+    The entry point matters: HumanEval's test blocks define
+    `def check(candidate)` and expect to be handed the function under test.
+    Calling `check(candidate)` instead — with no such name defined — raises
+    NameError for every problem and scores a flat 0%, no matter what the
+    model produced.
+    """
+    full = solution + "\n\n" + test_code + f"\n\ncheck({entry_point})"
     with tempfile.NamedTemporaryFile(
         mode='w', suffix='.py', delete=False, encoding='utf-8'
     ) as f:
@@ -235,17 +301,16 @@ def run_diagnostic(model, tokenizer, problems, device, n=5):
         test_code = p.get("test", "")
         model_p = make_model_prompt(he_prompt)
         raw = generate_body(model, tokenizer, model_p, device)
-        body = extract_body_lines(raw)
-        solution = build_solution(he_prompt, body)
-        ok = execute_solution(solution, test_code)
+        solution = best_solution(he_prompt, raw)
+        ok = execute_solution(solution, test_code, p["entry_point"])
 
         print(f"\n{task_id}  -->  {'PASS ✓' if ok else 'FAIL'}")
-        print(f"  Body      : {body[:3]}")
+        print(f"  Candidates: {len(extract_body_candidates(raw))}")
         print(f"  Solution  :\n{solution[:200]}")
         print("-" * 40)
 
 
-def run_humaneval():
+def run_humaneval(auto_yes=False, limit=None, skip_diagnostic=False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -268,14 +333,18 @@ def run_humaneval():
     model, tokenizer = load_model(device)
     print(f"  {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
 
-    run_diagnostic(model, tokenizer, problems, device, n=5)
+    if not skip_diagnostic:
+        run_diagnostic(model, tokenizer, problems, device, n=5)
 
-    print("\nProceed with full evaluation? (y/n): ", end="")
-    if input().strip().lower() != 'y':
-        print("Cancelled.")
-        return
+    if not auto_yes:
+        print("\nProceed with full evaluation? (y/n): ", end="")
+        if input().strip().lower() != 'y':
+            print("Cancelled.")
+            return
 
     task_ids = sorted(problems.keys())
+    if limit:
+        task_ids = task_ids[:limit]
     results = []
     passed = failed = 0
     t0 = time.time()
@@ -289,9 +358,8 @@ def run_humaneval():
 
         model_p = make_model_prompt(he_prompt)
         raw = generate_body(model, tokenizer, model_p, device)
-        body = extract_body_lines(raw)
-        solution = build_solution(he_prompt, body)
-        ok = execute_solution(solution, test_code)
+        solution = best_solution(he_prompt, raw)
+        ok = execute_solution(solution, test_code, p["entry_point"])
 
         if ok:
             passed += 1
@@ -329,7 +397,11 @@ def run_humaneval():
 
     with open(RESULTS_DIR / "summary.json", "w", encoding="utf-8") as f:
         json.dump({"model": "PyCraft-1", "pass_at_1": round(pass_at_1, 4),
-                   "passed": passed, "total": len(task_ids)}, f, indent=2)
+                   "passed": passed, "total": len(task_ids),
+                   "checkpoint": SFT_CHECKPOINT, "device": device,
+                   "max_new_tokens": MAX_NEW_TOKENS,
+                   "temperature": TEMPERATURE, "top_k": TOP_K,
+                   "elapsed_s": round(time.time() - t0, 1)}, f, indent=2)
 
     print(f"\n  Results saved to {RESULTS_DIR}/")
     print("=" * 60)
@@ -337,4 +409,14 @@ def run_humaneval():
 
 
 if __name__ == "__main__":
-    run_humaneval()
+    import argparse
+    ap = argparse.ArgumentParser(description="Run HumanEval against PyCraft-1")
+    ap.add_argument("-y", "--yes", action="store_true",
+                    help="skip the confirmation prompt (for unattended runs)")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="evaluate only the first N problems")
+    ap.add_argument("--skip-diagnostic", action="store_true",
+                    help="skip the 5-problem preview")
+    a = ap.parse_args()
+    run_humaneval(auto_yes=a.yes, limit=a.limit,
+                  skip_diagnostic=a.skip_diagnostic)
