@@ -417,6 +417,16 @@ if __name__ == "__main__":
                     help="evaluate only the first N problems")
     ap.add_argument("--skip-diagnostic", action="store_true",
                     help="skip the 5-problem preview")
+    ap.add_argument("--temperature", type=float, default=TEMPERATURE,
+                    help="0.0 selects greedy decoding, which is the "
+                         "conventional (and reproducible) way to report "
+                         "pass@1 from a single sample")
+    ap.add_argument("--top-k", type=int, default=TOP_K)
     a = ap.parse_args()
+
+    # generate_body reads these as module globals
+    TEMPERATURE = a.temperature
+    TOP_K = a.top_k
+
     run_humaneval(auto_yes=a.yes, limit=a.limit,
                   skip_diagnostic=a.skip_diagnostic)
