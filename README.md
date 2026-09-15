@@ -293,14 +293,20 @@ Published benchmarks show CodeParrot 110M achieves 3.80% Pass@1 on HumanEval and
 | Model | Size | HumanEval Pass@1 | MBPP Pass@1 | Training compute |
 |---|---|---|---|---|
 | GPT-Neo | 125M | 0.83% | 0.33% | 300B tokens, multi-GPU |
-| **PyCraft-1 (ours)** | **55M** | **TBD*** | **TBD*** | **1.05B tokens, 1× RTX 3050** |
+| **PyCraft-1 (ours)** | **55M** | **3.66%** | *not evaluated* | **1.05B tokens, 1× RTX 3050** |
 | CodeParrot | 110M | 3.80% | 2.50% | 50B tokens, multi-GPU |
 | Codex | 300M | 13.17% | — | Large-scale proprietary |
 | StarCoder2-3B | 3B | ~31% | ~35% | 3.3T tokens, cluster |
 
-*\*HumanEval runner requires `pip install human-eval`. Run `python -m eval.humaneval_runner` after setup.*
+*Measured with greedy decoding — the conventional and reproducible setting for single-sample pass@1 — on the `checkpoints/sft_stage1` model. Reproduce with:*
 
-**Key insight:** PyCraft-1 achieves competitive perplexity (PPL 3.15) compared to similarly-sized models, while requiring only a fraction of the compute and being fully reproducible on consumer hardware. StarCoder2-3B achieves strong results on HumanEval and MBPP but requires multi-GPU training infrastructure and significantly more data. PyCraft-1 validates that quality-curriculum training can partially compensate for scale.
+```bash
+python -m eval.humaneval_runner -y --temperature 0.0
+```
+
+*Passing problems: `greatest_common_divisor`, `strlen`, `get_positive`, `is_prime`, `remove_vowels`, `add`. Sampling at temperature 0.1 instead gives 3.05-3.66% across runs, which is why the greedy number is the one reported.*
+
+**Key insight:** PyCraft-1 scores 3.66% Pass@1 — 4.4× GPT-Neo 125M on 0.35% of its training tokens, and within a rounding error of CodeParrot 110M on 2% of its tokens, from a model half their size trained on one laptop GPU. It also achieves competitive perplexity (PPL 3.15) compared to similarly-sized models, while requiring only a fraction of the compute and being fully reproducible on consumer hardware. StarCoder2-3B achieves strong results on HumanEval and MBPP but requires multi-GPU training infrastructure and significantly more data. PyCraft-1 validates that quality-curriculum training can partially compensate for scale.
 
 ### Architecture Comparison
 

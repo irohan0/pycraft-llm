@@ -1,0 +1,12 @@
+{
+  "model": "PyCraft-1",
+  "pass_at_1": 3.6585,
+  "passed": 6,
+  "total": 164,
+  "checkpoint": "checkpoints/sft_stage1",
+  "device": "cpu",
+  "max_new_tokens": 400,
+  "temperature": 0.0,
+  "top_k": 10,
+  "elapsed_s": 459.9
+}
