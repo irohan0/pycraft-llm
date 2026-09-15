@@ -142,7 +142,12 @@ def compute_perplexity(
         labels = torch.tensor(
             ids[1:],  dtype=torch.long).unsqueeze(0).to(device)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        # bf16 autocast only on CUDA; CPU runs fp32 (Zen 3+ has no
+        # native bf16, so emulated autocast would be slower and no smaller).
+        if device == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _, loss = model(input_ids, labels)
+        else:
             _, loss = model(input_ids, labels)
 
         n_tokens = input_ids.shape[1]

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycraft-llm"
+version = "0.1.0"
+description = "A 55M-parameter Python code LLM trained from scratch, running locally on CPU"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Rohan Inamdar" }]
+keywords = ["llm", "code-generation", "python", "transformer", "gqa", "rope", "fim"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# torch 2.1 is the real floor: the only 2.3-specific API (a pinned SDPA
+# backend) was removed, and nothing here uses enable_gqa (2.5+).
+dependencies = [
+    "torch>=2.1",
+    "safetensors>=0.4",
+    "tokenizers>=0.19",
+]
+
+[project.optional-dependencies]
+serve = ["fastapi>=0.110", "uvicorn>=0.27", "pydantic>=2.0"]
+hub = ["huggingface_hub>=0.24"]
+all = ["fastapi>=0.110", "uvicorn>=0.27", "pydantic>=2.0", "huggingface_hub>=0.24"]
+
+[project.scripts]
+pycraft = "pycraft.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/irohan0/pycraft-llm"
+Model = "https://huggingface.co/imshadow0/pycraft-1"
+
+# Add-only layout: the training repo's top-level packages are kept exactly
+# where they are so training/, eval/ and the published HuggingFace package
+# keep working unchanged.
+#
+# CAVEAT: `model` and `tokenizer` are generic top-level names. That is fine
+# for the editable install this project is built around
+# (`pip install -e .` from a clone), but a non-editable install into a shared
+# environment could collide. Moving them under src/pycraft/ is the fix if
+# this is ever published to PyPI.
+[tool.setuptools]
+packages = ["pycraft", "model", "tokenizer", "data", "training", "eval"]
+
+[tool.setuptools.package-data]
+tokenizer = ["vocab/*.json"]

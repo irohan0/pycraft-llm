@@ -1,0 +1,9 @@
+.git/
+data/
+logs/
+upload_package/
+eval/humaneval_results/
+__pycache__/
+*.pyc
+# Keep only the SFT checkpoint; the pretrain checkpoints carry optimizer state
+checkpoints/step_*/

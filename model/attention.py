@@ -2,14 +2,14 @@
 # Grouped-Query Attention with:
 #   - Rotary Positional Embeddings (RoPE)
 #   - QK-Norm (2025 technique from OLMo 2 / Qwen 3)
-#   - PyTorch native SDPA (memory-efficient, no flash-attn dependency)
+#   - PyTorch native SDPA (backend auto-selected, no flash-attn dependency)
+#   - Optional KV-cache for incremental decoding
 #   - No bias terms (standard in modern LLMs)
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from model.config import PyCraftConfig
 
@@ -69,11 +69,25 @@ class RotaryEmbedding(nn.Module):
         self,
         q: torch.Tensor,   # (batch, n_heads, seq_len, head_dim)
         k: torch.Tensor,   # (batch, n_kv_heads, seq_len, head_dim)
-        offset: int = 0,   # for KV-cache offset during inference
+        offset: int = 0,   # absolute position of the first token
     ):
         seq_len = q.shape[2]
-        cos = self.cos_cache[offset: offset + seq_len]   # (seq_len, head_dim)
-        sin = self.sin_cache[offset: offset + seq_len]
+        max_pos = self.cos_cache.shape[0]
+
+        # Slicing past the end returns a SHORT tensor instead of raising,
+        # which surfaces later as a confusing broadcast error — or worse, as
+        # a plausible but positionally wrong result. Fail loudly instead.
+        if offset < 0 or offset + seq_len > max_pos:
+            raise ValueError(
+                f"RoPE positions [{offset}, {offset + seq_len}) exceed the "
+                f"precomputed table of {max_pos}. PyCraft-1 was trained with "
+                f"max_seq_len={max_pos}; truncate the prompt or stop generating."
+            )
+
+        # .to() is a no-op when dtypes already match; _build_cache hardcodes
+        # fp32, so this guards half/bf16 models.
+        cos = self.cos_cache[offset: offset + seq_len].to(q.dtype)
+        sin = self.sin_cache[offset: offset + seq_len].to(q.dtype)
 
         # Reshape for broadcasting: (1, 1, seq_len, head_dim)
         cos = cos.unsqueeze(0).unsqueeze(0)
@@ -90,8 +104,10 @@ class RotaryEmbedding(nn.Module):
 # Reduces KV-cache size by 4x with negligible quality loss.
 # ------------------------------------------------------------------ #
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, config: PyCraftConfig):
+    def __init__(self, config: PyCraftConfig, layer_idx: int = 0):
         super().__init__()
+        # Plain int — never enters state_dict, so checkpoints stay compatible.
+        self.layer_idx = layer_idx
         self.d_model = config.d_model
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
@@ -136,7 +152,9 @@ class GroupedQueryAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,                         # (batch, seq_len, d_model)
-        attn_mask: torch.Tensor | None = None,   # causal mask, pre-built
+        attn_mask: torch.Tensor | None = None,   # (1|B, 1, T, S) bool, True = attend
+        kv_cache=None,                           # KVCache, or None to disable
+        position_offset: int = 0,                # cached positions before this call
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
 
@@ -154,31 +172,50 @@ class GroupedQueryAttention(nn.Module):
                    self.head_dim).transpose(1, 2)
 
         # 3. QK-Norm (applied per-head, before RoPE)
-        #    Normalise each head vector independently
+        #    Normalise each head vector independently.
+        #    Cache-safe: RMSNorm reduces over the last dim only, so position t
+        #    depends on nothing but the vector at position t.
         if self.use_qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # 4. Apply RoPE to Q and K
-        q, k = self.rope(q, k)
+        # 4. Apply RoPE at true absolute positions
+        q, k = self.rope(q, k, offset=position_offset)
 
-        # 5. Expand K and V to match Q head count (GQA expansion)
-        k = self._repeat_kv(k)   # (batch, n_heads, seq, head_dim)
+        # 5. Append to the cache, read back everything written so far.
+        #    Stored PRE-expansion (n_kv_heads) — that 4x is the GQA memory win.
+        #    Keys are cached POST-RoPE; never re-rotate them.
+        if kv_cache is not None:
+            k, v = kv_cache.update(self.layer_idx, k, v)
+
+        # 6. Expand K and V to match Q head count (GQA expansion)
+        k = self._repeat_kv(k)   # (batch, n_heads, kv_len, head_dim)
         v = self._repeat_kv(v)
 
-        # 6. Scaled dot-product attention via PyTorch native SDPA
-        #    Uses memory-efficient attention automatically on Ampere GPUs.
-        #    is_causal=True applies the causal mask internally — no need to
-        #    pass an explicit mask during training (faster + less memory).
-        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
-            attn_out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,   # let is_causal handle it
-                dropout_p=0.0,
-                is_causal=True,
-            )
+        # 7. Scaled dot-product attention.
+        #    Backend is left to PyTorch: pinning one breaks CPU (the
+        #    memory-efficient kernel is CUDA-only) and blocks flash on GPU.
+        #
+        #    is_causal MUST be conditional. PyTorch builds it upper-left
+        #    aligned, so on a decode step (q_len=1, kv_len=N) it would mask
+        #    everything but the first prompt token — silently, with no error.
+        #    See build_attn_mask() in model/kv_cache.py.
+        kv_len = k.shape[2]
+        if attn_mask is None:
+            # Square (offset == 0) -> upper-left causal is correct.
+            # Single query (q_len == 1) -> may attend to all cached keys.
+            is_causal = (seq_len == kv_len)
+        else:
+            is_causal = False   # SDPA rejects mask + is_causal together
 
-        # 7. Merge heads and project back to d_model
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=is_causal,
+        )
+
+        # 8. Merge heads and project back to d_model
         # (batch, n_heads, seq, head_dim) → (batch, seq, d_model)
         attn_out = attn_out.transpose(1, 2).contiguous().view(
             batch, seq_len, self.d_model)

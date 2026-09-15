@@ -17,11 +17,11 @@ from model.feedforward import SwiGLU
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: PyCraftConfig):
+    def __init__(self, config: PyCraftConfig, layer_idx: int = 0):
         super().__init__()
         # Pre-norm for attention sublayer
         self.norm1 = RMSNorm(config.d_model)
-        self.attn = GroupedQueryAttention(config)
+        self.attn = GroupedQueryAttention(config, layer_idx=layer_idx)
 
         # Pre-norm for FFN sublayer
         self.norm2 = RMSNorm(config.d_model)
@@ -31,9 +31,13 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,                       # (batch, seq_len, d_model)
         attn_mask: torch.Tensor | None = None,
+        kv_cache=None,                         # KVCache, or None to disable
+        position_offset: int = 0,              # cached positions before this call
     ) -> torch.Tensor:
         # Attention sublayer with residual
-        x = x + self.attn(self.norm1(x), attn_mask)
+        x = x + self.attn(self.norm1(x), attn_mask,
+                          kv_cache=kv_cache,
+                          position_offset=position_offset)
         # FFN sublayer with residual
         x = x + self.ffn(self.norm2(x))
         return x

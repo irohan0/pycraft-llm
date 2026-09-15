@@ -85,7 +85,9 @@ class PyCraftTrainer:
             ],
             lr=config.learning_rate,
             betas=(config.beta1, config.beta2),
-            fused=True,
+            # fused AdamW is CUDA-only in torch 2.3; on CPU it raises at
+            # construction, so gate it on the actual device.
+            fused=(device == "cuda"),
         )
 
         self.scheduler = get_cosine_schedule_with_warmup(

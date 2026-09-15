@@ -603,14 +603,20 @@ def run_preference(
 
         if step % PREF_LOG_EVERY == 0:
             lr = opt.param_groups[0]["lr"]
-            avg = acc_sft + 0.1 * acc_pref
+            # Accumulators span PREF_LOG_EVERY optimiser steps, so divide by
+            # it — Stage 1 does the same. Without this a healthy loss of
+            # ~1.07 printed as ~10.7 and looked like divergence.
+            mean_sft = acc_sft / PREF_LOG_EVERY
+            mean_pref = acc_pref / PREF_LOG_EVERY
+            mean_gap = acc_gap / PREF_LOG_EVERY
+            avg = mean_sft + 0.1 * mean_pref
             if avg < best_loss:
                 best_loss = avg
             log(
                 f"pref step {step:>4} | "
-                f"sft {acc_sft:.4f} | "
-                f"pref {acc_pref:.4f} | "
-                f"gap {acc_gap:+.3f} | "
+                f"sft {mean_sft:.4f} | "
+                f"pref {mean_pref:.4f} | "
+                f"gap {mean_gap:+.3f} | "
                 f"lr {lr:.2e} | "
                 f"grad {grad_norm:.3f}"
             )
