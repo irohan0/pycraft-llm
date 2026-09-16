@@ -54,10 +54,7 @@ class PyCraft:
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        tok_path = Path(tokenizer_path or DEFAULT_TOKENIZER)
-        if not tok_path.exists():
-            tok_path = _hf_download("tokenizer/tokenizer.json")
-        self.tokenizer = PyCraftTokenizer(tok_path)
+        self.tokenizer = PyCraftTokenizer(_resolve_tokenizer(tokenizer_path))
 
         cfg = get_config_120m()
         cfg.vocab_size = self.tokenizer.vocab_size
@@ -287,6 +284,31 @@ def _earliest_stop(text: str, stops: list[str]) -> int | None:
     """Index of the earliest stop string in `text`, or None."""
     hits = [text.index(s) for s in stops if s in text]
     return min(hits) if hits else None
+
+
+def _resolve_tokenizer(tokenizer_path: str | Path | None) -> Path:
+    """
+    Find tokenizer.json across the layouts it legitimately appears in.
+
+    The repo keeps it at tokenizer/vocab/, but the HuggingFace repo publishes
+    it at tokenizer/, so a user who downloads the model into a clone ends up
+    with the second layout. Accepting both avoids a FileNotFoundError that
+    depends entirely on which instructions someone followed.
+    """
+    if tokenizer_path is not None:
+        p = Path(tokenizer_path)
+        if not p.exists():
+            raise FileNotFoundError(f"No tokenizer at {p}")
+        return p
+
+    for candidate in (
+        DEFAULT_TOKENIZER,                  # tokenizer/vocab/tokenizer.json
+        Path("tokenizer/tokenizer.json"),   # HuggingFace layout
+        Path("tokenizer.json"),             # flat
+    ):
+        if candidate.exists():
+            return candidate
+    return _hf_download("tokenizer/tokenizer.json")
 
 
 def _resolve_weights(checkpoint: str | Path | None) -> Path:

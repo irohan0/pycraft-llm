@@ -120,13 +120,18 @@ def cmd_serve(args):
               file=sys.stderr)
         return 1
 
-    print(f"  PyCraft-1 API on http://{args.host}:{args.port}")
-    print(f"  interactive docs: http://{args.host}:{args.port}/docs")
+    # flush=True: stdout is block-buffered when redirected to a file or pipe,
+    # so without it this banner (and the tunnel hint) never appears until the
+    # process exits.
+    print(f"  PyCraft-1 API on http://{args.host}:{args.port}", flush=True)
+    print(f"  interactive docs: http://{args.host}:{args.port}/docs", flush=True)
     if args.host == "127.0.0.1":
-        print("  to share temporarily (free, no account):")
-        print(f"    cloudflared tunnel --url http://127.0.0.1:{args.port}")
+        print("  to share temporarily (free, no account):", flush=True)
+        print(f"    cloudflared tunnel --url http://127.0.0.1:{args.port}",
+              flush=True)
     else:
-        print("  WARNING: bound beyond localhost and there is no auth.")
+        print("  WARNING: bound beyond localhost and there is no auth.",
+              flush=True)
     uvicorn.run("pycraft.server:app", host=args.host, port=args.port,
                 reload=False, log_level=args.log_level)
     return 0

@@ -405,40 +405,84 @@ def is_prime(n):
 
 ### Requirements
 
-- Python 3.11
-- CUDA-capable GPU (tested on RTX 3050 4GB) or CPU
-- ~2GB disk space for model weights
+- Python 3.10+
+- **No GPU required.** PyCraft-1 is 55M parameters and runs on CPU; CUDA is used when present but never needed.
+- ~250MB disk space for the weights and tokenizer (more only if you retrain)
 
 ### Setup
 
 ```bash
-# Clone the repository
 git clone https://github.com/irohan0/pycraft-llm.git
 cd pycraft-llm
 
-# Create conda environment
 conda create -n pycraft python=3.11 -y
 conda activate pycraft
 
-# Install PyTorch (CUDA 11.8)
-pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu118
+# CPU-only PyTorch (much smaller download than the CUDA build)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+# ...or, for an NVIDIA GPU:
+# pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu118
 
-# Install dependencies
-pip install safetensors tokenizers datasets huggingface_hub tqdm pyyaml
+pip install -e ".[serve,hub]"
+```
 
-# Download model weights from HuggingFace
+The weights and tokenizer are not in the repository (they are too large for git), so fetch them from HuggingFace:
+
+```bash
 python -c "
 from huggingface_hub import hf_hub_download
-hf_hub_download('imshadow0/pycraft-1', 'model.safetensors', local_dir='checkpoints/sft_stage1')
-hf_hub_download('imshadow0/pycraft-1', 'tokenizer/tokenizer.json', local_dir='.')
+import shutil, pathlib
+pathlib.Path('checkpoints/sft_stage1').mkdir(parents=True, exist_ok=True)
+pathlib.Path('tokenizer/vocab').mkdir(parents=True, exist_ok=True)
+shutil.copy(hf_hub_download('imshadow0/pycraft-1', 'model.safetensors'),
+            'checkpoints/sft_stage1/model.safetensors')
+shutil.copy(hf_hub_download('imshadow0/pycraft-1', 'tokenizer/tokenizer.json'),
+            'tokenizer/vocab/tokenizer.json')
 "
 ```
+
+You can skip this step entirely — if the files are absent, PyCraft downloads them from HuggingFace on first use.
 
 ---
 
 ## Quick Start
 
-### Code Completion
+### Command line
+
+```bash
+pycraft generate "# Task: check if a number is prime\n\ndef is_prime(n):\n"
+pycraft fim --prefix 'def square(n):\n    ' --suffix '\n\nprint(square(4))' --full
+pycraft chat
+pycraft info
+```
+
+### Python
+
+```python
+from pycraft import PyCraft
+
+pc = PyCraft()                       # add quantize=True for ~1.4x on CPU
+
+print(pc.complete_code("# Task: reverse a list\n\ndef reverse_list(xs):\n"))
+
+# Streaming
+for delta in pc.stream("def total(xs):\n", max_new_tokens=60):
+    print(delta, end="", flush=True)
+
+# Several prompts at once — roughly 4x aggregate throughput at batch 8
+print(pc.generate_batch(["def a():\n", "def b():\n"], max_new_tokens=40))
+
+# Fill in the middle (half of pretraining used this objective)
+print(pc.fill_in_middle(
+    prefix="def factorial(n):\n    if n <= 1:\n        return 1\n    ",
+    suffix="\n\nprint(factorial(5))\n",
+))
+# -> return n * factorial(n-1)
+```
+
+### Direct model access
+
+For training, evaluation, or anything that needs the raw module:
 
 ```python
 import torch
@@ -447,7 +491,6 @@ from model.config import get_config_120m
 from model.pycraft_model import PyCraftModel
 from tokenizer.tokenizer_utils import PyCraftTokenizer
 
-# Setup
 device    = "cuda" if torch.cuda.is_available() else "cpu"
 tokenizer = PyCraftTokenizer("tokenizer/vocab/tokenizer.json")
 
@@ -459,37 +502,26 @@ model = PyCraftModel(cfg).to(device)
 model.load_state_dict(load_file("checkpoints/sft_stage1/model.safetensors", device=device))
 model.eval()
 
-# Generate
-def complete_code(prompt: str, max_new_tokens: int = 100) -> str:
-    ids = tokenizer.encode(prompt)
-    inp = torch.tensor(ids, dtype=torch.long).unsqueeze(0).to(device)
-    with torch.no_grad():
-        out = model.generate(inp, max_new_tokens=max_new_tokens, 
-                             temperature=0.7, top_k=40)
-    new_ids = out[0, len(ids):].tolist()
-    return tokenizer.decode(new_ids)
-
-# Example
 prompt = "def fibonacci(n: int) -> int:\n    \"\"\"Return nth Fibonacci number.\"\"\"\n    "
-print(complete_code(prompt))
+ids    = tokenizer.encode(prompt)
+inp    = torch.tensor(ids, dtype=torch.long).unsqueeze(0).to(device)
+
+with torch.no_grad():
+    out = model.generate(inp, max_new_tokens=100, temperature=0.2, top_k=20,
+                         repetition_penalty=1.1)
+
+print(tokenizer.decode(out[0, len(ids):].tolist(), skip_special_tokens=True))
 ```
 
-### Instruction-Following (SFT model)
+Generation uses a KV cache and stops at `<|endoftext|>`. `temperature=0.0` selects greedy decoding; `top_p`, `repetition_penalty` and `stop_strings` are also supported.
 
-```python
-# Use the task comment format the model was trained on
-prompt = "# Task: Write a Python function to check if a string is a palindrome\n\n"
-print(complete_code(prompt, max_new_tokens=150))
-```
-
-### Run Evaluations
+### Run evaluations
 
 ```bash
-# Perplexity evaluation
-python -m eval.perplexity
-
-# Generation quality test
-python -m eval.evaluate
+python -m eval.perplexity                              # held-out PPL
+python -m eval.evaluate                                # generation samples
+python -m eval.humaneval_runner -y --temperature 0.0   # HumanEval, ~8 min on CPU
+python -m tests.test_kv_cache                          # correctness tests
 ```
 
 ---
@@ -687,6 +719,7 @@ python -m training.sft_train
 ```bash
 python -m eval.perplexity
 python -m eval.evaluate
+python -m eval.humaneval_runner -y --temperature 0.0
 ```
 
 ### Expected Results
@@ -700,6 +733,7 @@ python -m eval.evaluate
 | SFT step 400 | Training loss | ~1.15 |
 | SFT step 400 | PPL | ~3.15 |
 | Held-out eval | Average PPL | ~2.16 |
+| HumanEval (greedy) | Pass@1 | 3.66% (6/164) |
 
 ---
 
@@ -724,7 +758,8 @@ Complete, documented pipeline — tokenizer training, architecture implementatio
 ## Limitations
 
 - **Scale:** 55M parameters with 1.05B training tokens is below the Chinchilla-optimal compute budget. Larger models trained with this pipeline would likely outperform this baseline.
-- **Context window:** 1024 tokens limits reasoning over long functions or multi-file code.
+- **Context window:** 1024 tokens limits reasoning over long functions or multi-file code. This is a hard stop rather than a sliding window — the KV cache stores post-RoPE keys, which cannot be re-based without re-rotating every cached key.
+- **Markdown fences:** the SFT data (Magicoder) was full of ```python fences, so raw output often contains them. The CLI and API strip them by default; `strip_fences()` is exported for direct users.
 - **Benchmark scores:** HumanEval and MBPP scores are modest — the contribution is the methodology and reproducibility, not state-of-the-art performance.
 - **Language coverage:** Python-only. No multilingual code capability.
 - **No RLHF:** The SFT model is not aligned with human preferences beyond instruction format.
