@@ -759,7 +759,7 @@ Complete, documented pipeline — tokenizer training, architecture implementatio
 
 - **Scale:** 55M parameters with 1.05B training tokens is below the Chinchilla-optimal compute budget. Larger models trained with this pipeline would likely outperform this baseline.
 - **Context window:** 1024 tokens limits reasoning over long functions or multi-file code. This is a hard stop rather than a sliding window — the KV cache stores post-RoPE keys, which cannot be re-based without re-rotating every cached key.
-- **Markdown fences:** the SFT data (Magicoder) was full of ```python fences, so raw output often contains them. The CLI and API strip them by default; `strip_fences()` is exported for direct users.
+- **Markdown fences:** the SFT data (Magicoder) was full of markdown code fences, so raw output often contains them. The CLI and API strip them by default; `strip_fences()` is exported for direct users.
 - **Benchmark scores:** HumanEval and MBPP scores are modest — the contribution is the methodology and reproducibility, not state-of-the-art performance.
 - **Language coverage:** Python-only. No multilingual code capability.
 - **No RLHF:** The SFT model is not aligned with human preferences beyond instruction format.
